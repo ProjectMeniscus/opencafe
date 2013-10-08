@@ -123,10 +123,13 @@ def skip_open_issue(type, bug_id):
     @param type: The issue tracker type (e.g., Launchpad, GitHub).
     @param bug_id: ID of the issue for the test.
     """
-    if type.lower() == 'launchpad' and LaunchpadTracker.is_bug_open(
-            bug_id=bug_id):
-        return skip('Launchpad Bug #{0}'.format(bug_id))
-    elif type.lower() == 'github' and GitHubTracker.is_bug_open(
-            issue_id=bug_id):
-        return skip('GitHub Issue #{0}'.format(bug_id))
+    try:
+        if type.lower() == 'launchpad' and LaunchpadTracker.is_bug_open(
+                bug_id=bug_id):
+            return skip('Launchpad Bug #{0}'.format(bug_id))
+        elif type.lower() == 'github' and GitHubTracker.is_bug_open(
+                issue_id=bug_id):
+            return skip('GitHub Issue #{0}'.format(bug_id))
+    except Exception as e:
+        print e
     return lambda obj: obj
