@@ -21,6 +21,7 @@ import platform
 import sys
 import textwrap
 import getpass
+import shutil
 from ConfigParser import SafeConfigParser
 from cafe.engine.config import EngineConfig
 
@@ -53,56 +54,34 @@ class PlatformManager(object):
 
     @classmethod
     def get_user_home_path(cls):
-        if PlatformManager.USING_VIRTUALENV:
+        if cls.USING_VIRTUALENV:
             return sys.prefix
         else:
             return os.path.expanduser("~{0}".format(cls.get_current_user()))
 
     @classmethod
     def get_user_uid(cls):
-        if not PlatformManager.USING_WINDOWS:
+        if not cls.USING_WINDOWS:
             working_user = cls.get_current_user()
             return pwd.getpwnam(working_user).pw_uid
 
     @classmethod
     def get_user_gid(cls):
-        if not PlatformManager.USING_WINDOWS:
+        if not cls.USING_WINDOWS:
             working_user = cls.get_current_user()
             return pwd.getpwnam(working_user).pw_gid
 
+    @classmethod
+    def safe_chown(cls, path):
+        if not cls.USING_WINDOWS:
+            uid = cls.get_user_uid()
+            gid = cls.get_user_gid()
+            os.chown(path, uid, gid)
 
-class UnittestRunnerTestEnvManager(object):
-    """DO NOT USE
-    Supports the current unittest runner until it can be refactored to use
-    the regular TestEnvManager, at which time this class will be deleted"""
-
-    @staticmethod
-    def set_engine_config_path():
-        os.environ['CAFE_ENGINE_CONFIG_FILE_PATH'] = \
-            EngineConfigManager.ENGINE_CONFIG_PATH
-        return EngineConfigManager.ENGINE_CONFIG_PATH
-
-    @staticmethod
-    def get_engine_config_interface():
-        return EngineConfig(EngineConfigManager.ENGINE_CONFIG_PATH)
-
-    @staticmethod
-    def set_test_repo_package_path():
-        eng_conf = EngineConfig(EngineConfigManager.ENGINE_CONFIG_PATH)
-        test_repo_package = eng_conf.default_test_repo
-
-        os.environ["CAFE_TEST_REPO_PACKAGE"] = test_repo_package
-
-        module_info = None
-        try:
-            module_info = imp.find_module(test_repo_package)
-        except ImportError as exception:
-            print "Cannot find test repo '{0}'".format(test_repo_package)
-            raise exception
-
-        test_repo_path = module_info[1]
-        os.environ["CAFE_TEST_REPO_PATH"] = test_repo_path
-        return test_repo_path
+    @classmethod
+    def safe_create_dir(cls, directory_path):
+        if not os.path.exists(directory_path):
+            os.makedirs(directory_path)
 
 
 class TestEnvManager(object):
@@ -112,6 +91,23 @@ class TestEnvManager(object):
     Usefull for writing bootstrappers for runners and scripts.
     """
 
+    class _lazy_property(object):
+        '''
+        meant to be used for lazy evaluation of an object attribute.
+        property should represent non-mutable data, as it replaces itself.
+        '''
+
+        def __init__(self, func):
+            self.func = func
+            self.func_name = func.__name__
+
+        def __get__(self, obj, cls):
+            if obj is None:
+                return None
+            value = self.func(obj)
+            setattr(obj, self.func_name, value)
+            return value
+
     def __init__(
             self, product_name, test_config_file_name,
             engine_config_path=None):
@@ -120,21 +116,9 @@ class TestEnvManager(object):
         self.test_config_file_name = test_config_file_name
         self.engine_config_path = engine_config_path or \
             EngineConfigManager.ENGINE_CONFIG_PATH
-        os.environ['CAFE_ENGINE_CONFIG_FILE_PATH'] = \
-            self.engine_config_path
         self.engine_config_interface = EngineConfig(self.engine_config_path)
 
-        #Property value vars
-        self._test_repo_path = None
-        self._test_repo_package = None
-        self._test_data_directory = None
-        self._test_root_log_dir = None
-        self._test_log_dir = None
-        self._test_logging_verbosity = None
-        self._test_config_file_path = None
-        self._test_master_log_file_name = None
-
-    def finalize(self, create_log_dirs=True, set_defaults=True):
+    def finalize(self, create_log_dirs=True, set_os_env_vars=True):
         """
         Sets all non-configured values to the defaults in the engine.config
         file. set_defaults=False will override this behavior, but note that
@@ -153,59 +137,37 @@ class TestEnvManager(object):
             if not os.path.exists(path):
                 os.makedirs(path)
 
-        if set_defaults:
-            self.test_repo_path = self.test_repo_path
-            self.test_repo_package = self.test_repo_package
-            self.test_data_directory = self.test_data_directory
-            self.test_root_log_dir = self.test_root_log_dir
-            self.test_log_dir = self.test_log_dir
-            self.test_config_file_path = self.test_config_file_path
-            self.test_logging_verbosity = self.test_logging_verbosity
-            self.test_master_log_file_name = self.test_master_log_file_name
+        _check(self.test_repo_path)
+        _check(self.test_data_directory)
+        _check(self.test_config_file_path)
 
         if create_log_dirs:
             _create(self.test_root_log_dir)
             _create(self.test_log_dir)
 
-        _check(self.test_repo_path)
-        _check(self.test_data_directory)
         _check(self.test_root_log_dir)
         _check(self.test_log_dir)
-        _check(self.test_config_file_path)
 
-    @property
+        if set_os_env_vars:
+            os.environ['CAFE_ENGINE_CONFIG_FILE_PATH'] = \
+                self.engine_config_path
+            os.environ["CAFE_TEST_REPO_PACKAGE"] = self.test_repo_package
+            os.environ["CAFE_TEST_REPO_PATH"] = self.test_repo_path
+            os.environ["CAFE_DATA_DIR_PATH"] = self.test_data_directory
+            os.environ["CAFE_ROOT_LOG_PATH"] = self.test_root_log_dir
+            os.environ["CAFE_TEST_LOG_PATH"] = self.test_log_dir
+            os.environ["CAFE_CONFIG_FILE_PATH"] = self.test_config_file_path
+            os.environ["CAFE_LOGGING_VERBOSITY"] = self.test_logging_verbosity
+            os.environ["CAFE_MASTER_LOG_FILE_NAME"] = \
+                self.test_master_log_file_name
+
+    @_lazy_property
     def test_repo_path(self):
-        return self._test_repo_path
-
-    @test_repo_path.setter
-    def test_repo_path(self, test_repo_path=None):
         """NOTE:  There is no default for test_repo_path because we don't
-        officially support non-package test repos yet, even though every
-        runner just gets the path to the test repo package.
-
-        This is set by the test_repo_package property as a convenience.
+        officially support test repo paths yet, even though every runner just
+        gets the path to the test repo package.
         """
 
-        self._test_repo_path = test_repo_path
-        os.environ["CAFE_TEST_REPO_PATH"] = str(self._test_repo_path)
-
-    @property
-    def test_repo_package(self):
-        return self._test_repo_package
-
-    @test_repo_package.setter
-    def test_repo_package(self, test_repo_package=None):
-        """NOTE: The actual test repo package is never used by any current
-        runners, instead they reference the root path to the tests.  For that
-        reason, it sets the CAFE_TEST_REPO_PATH directly as well as
-        CAFE_TEST_REPO_PACKAGE
-        """
-        self._test_repo_package = test_repo_package or \
-            self.engine_config_interface.default_test_repo
-
-        os.environ["CAFE_TEST_REPO_PACKAGE"] = self._test_repo_package
-
-        #Also set test repo package path
         module_info = None
         try:
             module_info = imp.find_module(self.test_repo_package)
@@ -213,87 +175,54 @@ class TestEnvManager(object):
             print "Cannot find test repo '{0}'".format(self.test_repo_package)
             raise exception
 
-        self.test_repo_path = module_info[1]
-        os.environ["CAFE_TEST_REPO_PATH"] = self.test_repo_path
+        return str(module_info[1])
 
-    @property
+    @_lazy_property
+    def test_repo_package(self):
+        """NOTE: The actual test repo package is never used by any current
+        runners, instead they reference the root path to the tests.  For that
+        reason, it sets the CAFE_TEST_REPO_PATH directly as well as
+        CAFE_TEST_REPO_PACKAGE
+        """
+        return os.path.expanduser(
+            self.engine_config_interface.default_test_repo)
+
+    @_lazy_property
     def test_data_directory(self):
-        return self._test_data_directory
+        return os.path.expanduser(self.engine_config_interface.data_directory)
 
-    @test_data_directory.setter
-    def test_data_directory(self, test_data_directory=None):
-        self._test_data_directory = test_data_directory or \
-            self.engine_config_interface.data_directory
-
-        os.environ["CAFE_DATA_DIR_PATH"] = self._test_data_directory
-
-    @property
+    @_lazy_property
     def test_root_log_dir(self):
-        return self._test_root_log_dir
+        return os.path.expanduser(
+            os.path.join(
+                self.engine_config_interface.log_directory, self.product_name,
+                self.test_config_file_name))
 
-    @test_root_log_dir.setter
-    def test_root_log_dir(self, test_root_log_dir=None):
-        self._test_root_log_dir = test_root_log_dir or os.path.join(
-            self.engine_config_interface.log_directory, self.product_name,
-            self.test_config_file_name)
-
-        os.environ["CAFE_ROOT_LOG_PATH"] = self._test_root_log_dir
-
-    @property
+    @_lazy_property
     def test_log_dir(self):
-        return self._test_log_dir
-
-    @test_log_dir.setter
-    def test_log_dir(self, test_log_dir=None):
         log_dir_name = str(datetime.datetime.now()).replace(" ", "_").replace(
             ":", "_")
+        return os.path.expanduser(
+            os.path.join(self.test_root_log_dir, log_dir_name))
 
-        self._test_root_log_dir = self.test_root_log_dir or \
-            self.engine_config_interface.log_directory
-
-        self._test_log_dir = test_log_dir or os.path.join(
-            self.test_root_log_dir, log_dir_name)
-
-        os.environ["CAFE_TEST_LOG_PATH"] = self._test_log_dir
-
-    @property
+    @_lazy_property
     def test_config_file_path(self):
-        return self._test_config_file_path
+        return os.path.expanduser(
+            os.path.join(
+                self.engine_config_interface.config_directory,
+                self.product_name, self.test_config_file_name))
 
-    @test_config_file_path.setter
-    def test_config_file_path(self, test_config_file_path=None):
-        self._test_config_file_path = test_config_file_path or os.path.join(
-            self.engine_config_interface.config_directory, self.product_name,
-            self.test_config_file_name)
-
-        os.environ["CAFE_CONFIG_FILE_PATH"] = self._test_config_file_path
-
-    @property
+    @_lazy_property
     def test_logging_verbosity(self):
-        return self._test_logging_verbosity
-
-    @test_logging_verbosity.setter
-    def test_logging_verbosity(self, test_logging_verbosity=None):
         """Currently supports STANDARD and VERBOSE.
         TODO: Implement 'OFF' option that adds null handlers to all loggers
 
         """
-        self._test_logging_verbosity = test_logging_verbosity or \
-            self.engine_config_interface.logging_verbosity
+        return self.engine_config_interface.logging_verbosity
 
-        os.environ["CAFE_LOGGING_VERBOSITY"] = self._test_logging_verbosity
-
-    @property
-    def test_master_log_file_name(self, test_master_log_file_name=None):
-        return self._test_master_log_file_name
-
-    @test_master_log_file_name.setter
-    def test_master_log_file_name(self, test_master_log_file_name=None):
-        self._test_master_log_file_name = test_master_log_file_name or \
-            str(self.engine_config_interface.master_log_file_name)
-
-        os.environ["CAFE_MASTER_LOG_FILE_NAME"] = \
-            self._test_master_log_file_name
+    @_lazy_property
+    def test_master_log_file_name(self):
+        return self.engine_config_interface.master_log_file_name
 
 
 class EngineDirectoryManager(object):
@@ -322,7 +251,7 @@ class EngineDirectoryManager(object):
     wrapper = textwrap.TextWrapper(
         initial_indent="* ", subsequent_indent="  ", break_long_words=False)
 
-    #Old .cloudcafe directories
+    # Old .cloudcafe directories
     _OLD_ROOT_DIR = os.path.join(
         PlatformManager.get_user_home_path(), ".cloudcafe")
     _OLD_CAFE_DIRS = _Namespace(
@@ -330,7 +259,7 @@ class EngineDirectoryManager(object):
         DATA_DIR=os.path.join(_OLD_ROOT_DIR, 'data'),
         TEMP_DIR=os.path.join(_OLD_ROOT_DIR, 'temp'))
 
-    #Current .opencafe Directories
+    # Current .opencafe Directories
     OPENCAFE_ROOT_DIR = os.path.join(
         PlatformManager.get_user_home_path(), ".opencafe")
 
@@ -341,7 +270,7 @@ class EngineDirectoryManager(object):
         CONFIG_DIR=os.path.join(OPENCAFE_ROOT_DIR, 'configs'))
 
     @classmethod
-    def update_existing_directories(cls):
+    def update_deprecated_engine_directories(cls):
         """
         Applies to an existing .cloudcafe (old) or .opencafe (new) directory
         all changes made to the default .opencafe directory structure since
@@ -366,26 +295,38 @@ class EngineDirectoryManager(object):
                         cls._OLD_ROOT_DIR, cls.OPENCAFE_ROOT_DIR))
 
     @classmethod
-    def create_default_directories(cls):
-        print cls.wrapper.fill(
-            'Creating default directories in {0}'.format(
-                cls.OPENCAFE_ROOT_DIR))
+    def create_engine_directories(cls):
+        print cls.wrapper.fill('Creating default directories in {0}'.format(
+            cls.OPENCAFE_ROOT_DIR))
 
+        # Create the opencafe root dir and sub dirs
+        PlatformManager.safe_create_dir(cls.OPENCAFE_ROOT_DIR)
+        print cls.wrapper.fill('...created {0}'.format(cls.OPENCAFE_ROOT_DIR))
         for _, directory_path in cls.OPENCAFE_SUB_DIRS.items():
-            if not os.path.exists(directory_path):
-                os.makedirs(directory_path)
-                if not PlatformManager.USING_WINDOWS:
-                    uid = PlatformManager.get_user_uid()
-                    gid = PlatformManager.get_user_gid()
-                    os.chown(directory_path, uid, gid)
+            PlatformManager.safe_create_dir(directory_path)
+            print cls.wrapper.fill('...created {0}'.format(directory_path))
+
+    @classmethod
+    def set_engine_directory_permissions(cls):
+        """Recursively changes permissions default engine directory so that
+        everything is user-owned"""
+
+        PlatformManager.safe_chown(cls.OPENCAFE_ROOT_DIR)
+        for root, dirs, files in os.walk(cls.OPENCAFE_ROOT_DIR):
+            for d in dirs:
+                PlatformManager.safe_chown(os.path.join(root, d))
+            for f in files:
+                PlatformManager.safe_chown(os.path.join(root, f))
 
     @classmethod
     def build_engine_directories(cls):
+        """Updates, creates, and owns (as needed) all default directories"""
+
         if (os.path.exists(cls.OPENCAFE_ROOT_DIR) or
                 os.path.exists(cls._OLD_ROOT_DIR)):
-            cls.update_existing_directories()
-        else:
-            cls.create_default_directories()
+            cls.update_deprecated_engine_directories()
+        cls.create_engine_directories()
+        cls.set_engine_directory_permissions()
 
 
 class EngineConfigManager(object):
@@ -510,7 +451,7 @@ class EngineConfigManager(object):
                 "to the new functional equivalent '{1}'".format(
                     current_value, new_value))
 
-        #'default_test_repo' value changed from 'test_repo' to 'cloudroast'
+        # 'default_test_repo' value changed from 'test_repo' to 'cloudroast'
         config_keys = [key for key, _ in config.items('OPENCAFE_ENGINE')]
         if ('default_test_repo' in config_keys and config.get(
                 'OPENCAFE_ENGINE', 'default_test_repo') == 'test_repo'):
@@ -522,7 +463,7 @@ class EngineConfigManager(object):
                 "OPENCAFE_ENGINE section of your engine.config has been "
                 "changed from 'test_repo' to 'cloudroast'")
 
-        #'config_dir' was added as a configurable option
+        # 'config_dir' was added as a configurable option
         config_keys = [key for key, _ in config.items('OPENCAFE_ENGINE')]
         if 'config_directory' not in config_keys:
             update_tracker.register_update(config)
@@ -534,6 +475,7 @@ class EngineConfigManager(object):
                 "OPENCAFE_ENGINE section of your engine.config".format(
                     EngineDirectoryManager.OPENCAFE_SUB_DIRS.CONFIG_DIR))
 
+        # 'master_log_file_name' was added as a configurable option
         config_keys = [key for key, _ in config.items('OPENCAFE_ENGINE')]
         if 'master_log_file_name' not in config_keys:
             update_tracker.register_update(config)
@@ -579,11 +521,7 @@ class EngineConfigManager(object):
         cfp = open(path, 'w+')
         config_parser_object.write(cfp)
         cfp.close()
-
-        if not PlatformManager.USING_WINDOWS:
-            uid = PlatformManager.get_user_uid()
-            gid = PlatformManager.get_user_gid()
-            os.chown(path, uid, gid)
+        PlatformManager.safe_chown(path)
 
     @classmethod
     def build_engine_config(cls):
@@ -600,3 +538,38 @@ class EngineConfigManager(object):
             config = cls.generate_default_engine_config()
 
         cls.write_and_chown_config(config, cls.ENGINE_CONFIG_PATH)
+
+    @classmethod
+    def install_optional_configs(cls, source_directory, print_progress=True):
+        if print_progress:
+            twrap = textwrap.TextWrapper(
+                initial_indent='* ', subsequent_indent='  ',
+                break_long_words=False)
+            print twrap.fill(
+                'Installing reference configuration files in ...'.format(
+                    EngineDirectoryManager.OPENCAFE_ROOT_DIR))
+            twrap = textwrap.TextWrapper(
+                initial_indent='  ', subsequent_indent='  ',
+                break_long_words=False)
+
+        _printed = []
+        for root, sub_folders, files in os.walk(source_directory):
+            for file_ in files:
+                source = os.path.join(root, file_)
+                destination_dir = os.path.join(
+                    EngineDirectoryManager.OPENCAFE_ROOT_DIR, root)
+                destination_file = os.path.join(destination_dir, file_)
+                PlatformManager.safe_create_dir(destination_dir)
+                PlatformManager.safe_chown(destination_dir)
+
+                if print_progress:
+                    'Installing {0} at {1}'.format(source, destination_dir)
+
+                shutil.copyfile(source, destination_file)
+
+                if print_progress:
+                    if destination_dir not in _printed:
+                        print twrap.fill('{0}'.format(destination_dir))
+                        _printed.append(destination_dir)
+
+                PlatformManager.safe_chown(destination_file)

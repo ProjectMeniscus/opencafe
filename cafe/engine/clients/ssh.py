@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import socket
 import StringIO
 import time
@@ -35,7 +36,7 @@ class SSHAuthStrategy:
     KEY_FILE_LIST = 'key_file_list'
 
 
-class SSHClient(ParamikoSSHClient):
+class ExtendedParamikoSSHClient(ParamikoSSHClient):
 
     def exec_command(self, command, bufsize=-1, timeout=None, get_pty=False,
                      return_exit_status=False):
@@ -71,11 +72,13 @@ class BaseSSHClient(BaseClient):
         """
         self.ssh_connection = None
         self.host = host
+        self._chan = None
 
     def connect(self, username=None, password=None,
                 accept_missing_host_key=True, tcp_timeout=30,
                 auth_strategy=SSHAuthStrategy.PASSWORD,
-                port=22, key=None, allow_agent=True, key_filename=None):
+                port=22, key=None, allow_agent=True,
+                key_filename=None, key_filename_password=None):
         """
         Attempts to connect to a remote server via SSH
 
@@ -91,6 +94,8 @@ class BaseSSHClient(BaseClient):
         @type key: string
         @param key_filename: Name of a file that contains a SSH key
         @type key_filename: string
+        @param key_filename_password: The password for the SSH key, if needed
+        @type key_filename_password: string
         @param allow_agent: Set to False to disable connecting to
                             the SSH agent
         @type allow_agent: bool
@@ -102,7 +107,7 @@ class BaseSSHClient(BaseClient):
         @return: None
         """
 
-        ssh = SSHClient()
+        ssh = ExtendedParamikoSSHClient()
         if accept_missing_host_key:
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -122,7 +127,10 @@ class BaseSSHClient(BaseClient):
             key = paramiko.RSAKey.from_private_key(key_file)
             connect_args['pkey'] = key
         if auth_strategy == SSHAuthStrategy.KEY_FILE_LIST:
-            connect_args['key_filename'] = key_filename
+            key_file_path = os.path.expanduser(key_filename)
+            key = paramiko.RSAKey.from_private_key_file(
+                filename=key_file_path, password=key_filename_password)
+            connect_args['pkey'] = key
 
         try:
             ssh.connect(**connect_args)
@@ -158,6 +166,107 @@ class BaseSSHClient(BaseClient):
     def is_connected(self):
         """Checks to see if an SSH connection exists."""
         return self.ssh_connection is not None
+
+    def start_shell(self, retries=5):
+        """
+        @summary: Starts a shell instance of SSH to use with multiple commands.
+
+        """
+        # large width and height because of need to parse output of commands
+        # in exec_shell_command
+        retry_count = 0
+        while retry_count < retries:
+            try:
+                self._chan = self.ssh_connection.invoke_shell(width=9999999,
+                                                              height=9999999)
+                if self._chan is not None:
+                    break
+            except SSHException, msg:
+                retry_count = retry_count + 1
+                self._log.error("Channel attempt {0} failed \n {1}".format(
+                    retry_count,
+                    msg))
+
+        # wait until buffer has data
+        while not self._chan.recv_ready():
+            time.sleep(1)
+
+        # clearing initial buffer, usually login information
+        while self._chan.recv_ready():
+            self._chan.recv(1024)
+
+    def end_shell(self):
+        if not self._chan.closed:
+            self._chan.close()
+        self._chan = None
+
+    def wait_for_active_shell(self, max_time):
+        if not self.is_connected():
+            message = 'Not currently connected to {host}.'.format(
+                host=self.host)
+            self._log.error(message)
+            raise Exception(message)
+        if self._chan is None or self._chan.closed:
+            self.start_shell()
+        while not self._chan.send_ready() and time.time() < max_time:
+            time.sleep(1)
+
+    def read_shell_response(self, prompt, max_time):
+        output = ''
+        while time.time() < max_time:
+            while not self._chan.recv_ready() and time.time() < max_time:
+                time.sleep(1)
+            if not self._chan.recv_ready():
+                break
+            current = self._chan.recv(1024)
+            output += current
+            if not prompt:
+                break
+            if current.find(prompt) != -1:
+                self._log.debug('SHELL-PROMPT-FOUND: %s' % prompt)
+                break
+            self._log.debug('Current response: {0}'.format(current))
+            self._log.debug(
+                "Looking for prompt: {0}.Time remaining: {1}".format(
+                    prompt, max_time - time.time()))
+            self._chan.get_transport().set_keepalive(1000)
+        self._log.debug('SHELL-COMMAND-RETURN: {0}'.format(output))
+        return output
+
+    def execute_shell_command(self,
+                              cmd,
+                              prompt=None,
+                              timeout=100):
+        """
+        @summary: Executes a command in shell mode and receives all of
+            the response.  Parses the response and returns the output
+            of the command and the prompt.
+        @return: Returns the output of the command and the prompt.
+
+        """
+
+        max_time = time.time() + timeout
+        if not cmd.endswith("\n"):
+            cmd = "{0}\n".format(cmd)
+        self._log.debug('EXEC-SHELLing: {0}'.format(cmd))
+        self.wait_for_active_shell(max_time)
+        if not self._chan.send_ready():
+            self._log.error("Channel timed out for send ready")
+            return ExecResponse(
+                stdin=None,
+                stdout=None,
+                stderr=None)
+        self._chan.send(cmd)
+        output = self.read_shell_response(prompt,
+                                          max_time)
+        if self._chan.recv_stderr_ready():
+            stderr = self._chan.recv_stderr(1024)
+        else:
+            stderr = None
+        return ExecResponse(
+            stdin=self._chan.makefile('wb'),
+            stdout=output,
+            stderr=stderr)
 
     def execute_command(self, command, return_exit_status=False):
         """
@@ -208,12 +317,13 @@ class BaseSSHClient(BaseClient):
         return response
 
 
-class SSHBehaviors(BaseSSHClient):
+class SSHClient(BaseSSHClient):
 
     def __init__(self, username=None, password=None, host=None,
                  tcp_timeout=None, auth_strategy=None, port=22,
                  look_for_keys=None, key=None, key_filename=None,
-                 allow_agent=True, accept_missing_host_key=True):
+                 key_filename_password=None, allow_agent=True,
+                 accept_missing_host_key=True):
         """
         Initialization
         @param username: Username to be used for SSH connection
@@ -233,6 +343,8 @@ class SSHBehaviors(BaseSSHClient):
         @type key: string
         @param key_filename: Name of a file that contains a SSH key
         @type key_filename: string
+        @param key_filename_password: The password for the SSH key, if needed
+        @type key_filename_password: string
         @param allow_agent: Set to False to disable connecting to
                             the SSH agent
         @type allow_agent: bool
@@ -242,7 +354,7 @@ class SSHBehaviors(BaseSSHClient):
                                         host key in the local system
         @type accept_missing_host_key: bool
         """
-        super(SSHBehaviors, self).__init__(host=host)
+        super(SSHClient, self).__init__(host=host)
         self.username = username
         self.password = password
         self.host = host
@@ -251,6 +363,7 @@ class SSHBehaviors(BaseSSHClient):
         self.look_for_keys = look_for_keys
         self.key = key
         self.key_filename = key_filename
+        self.key_filename_password = key_filename_password
         self.allow_agent = allow_agent
         self.port = port
         self.accept_missing_host_key = accept_missing_host_key
@@ -279,7 +392,8 @@ class SSHBehaviors(BaseSSHClient):
                 auth_strategy=self.auth_strategy,
                 port=self.port, key=self.key,
                 allow_agent=self.allow_agent,
-                key_filename=self.key_filename)
+                key_filename=self.key_filename,
+                key_filename_password=self.key_filename_password)
             if self.is_connected():
                 return True
             time.sleep(cooldown)
@@ -309,7 +423,8 @@ class SSHBehaviors(BaseSSHClient):
                 auth_strategy=self.auth_strategy,
                 port=self.port, key=self.key,
                 allow_agent=self.allow_agent,
-                key_filename=self.key_filename)
+                key_filename=self.key_filename,
+                key_filename_password=self.key_filename_password)
             if self.is_connected():
                 return True
             time.sleep(cooldown)

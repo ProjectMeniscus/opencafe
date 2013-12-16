@@ -43,6 +43,14 @@ class JSON_ToolsMixin(object):
 
 class XML_ToolsMixin(object):
     """Methods used to make building xml data models easier"""
+    _XML_VERSION = '1.0'
+    _ENCODING = 'UTF-8'
+
+    @property
+    def xml_header(self):
+        return "<?xml version='{version}' encoding='{encoding}'?>".format(
+            version=self._XML_VERSION, encoding=self._ENCODING)
+
     @staticmethod
     def _set_xml_etree_element(
             xml_etree, property_dict, exclude_empty_properties=True):
@@ -101,14 +109,18 @@ class BaseModel(object):
 
     def __str__(self):
         strng = '<{0} object> {1}'.format(
-            self.__class__.__name__, self.__REPR_SEPARATOR__)
-        for key in self.__dict__.keys():
-            if str(key) == '_log':
+            type(self).__name__, self.__REPR_SEPARATOR__)
+        for key in vars(self).keys():
+            val = getattr(self, key)
+            if isinstance(val, cclogging.logging.Logger):
                 continue
-            strng = '{0}{1} = {2}{3}'.format(
-                strng, str(key), str(self.__dict__[key]),
-                self.__REPR_SEPARATOR__)
-        return strng
+            elif isinstance(val, unicode):
+                strng = '{0}{1} = {2}{3}'.format(
+                    strng, key, val.encode("utf-8"), self.__REPR_SEPARATOR__)
+            else:
+                strng = '{0}{1} = {2}{3}'.format(
+                    strng, key, val, self.__REPR_SEPARATOR__)
+        return '{0}'.format(strng)
 
     def __repr__(self):
         return self.__str__()

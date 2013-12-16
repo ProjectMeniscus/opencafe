@@ -75,7 +75,8 @@ class BaseCommandLineClient(BaseClient):
         os_response = CommandLineResponse()
 
         #Process command we received
-        os_response.command = "{0} {1}".format(self.base_command, cmd)
+        os_response.command = "{0} {1}".format(
+            self.base_command, cmd) if self.base_command else cmd
         if args and args[0]:
             for arg in args[0]:
                 os_response.command += "{0} {1}".format(
@@ -102,7 +103,7 @@ class BaseCommandLineClient(BaseClient):
         try:
             os_process = subprocess.Popen(os_response.command,
                                           stdout=subprocess.PIPE,
-                                          stderr=subprocess.STDOUT,
+                                          stderr=subprocess.PIPE,
                                           shell=True)
         except subprocess.CalledProcessError() as cpe:
             self._log.exception(

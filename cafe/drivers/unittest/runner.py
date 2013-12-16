@@ -15,31 +15,82 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import argparse
+import imp
 import os
 import sys
 import time
-import argparse
-import unittest2 as unittest
-from re import search
-from multiprocessing import Process, Manager
-from datetime import datetime
-from imp import find_module, load_module
-from inspect import getmembers, isclass
 from fnmatch import fnmatch
+from inspect import getmembers, isclass
+from multiprocessing import Process, Manager
+from re import search
 from traceback import extract_tb
+import unittest2 as unittest
 from cafe.drivers.unittest.fixtures import BaseTestFixture
 from cafe.common.reporting.cclogging import log_results
 from cafe.drivers.unittest.parsers import SummarizeResults
 from cafe.drivers.unittest.decorators import (
     TAGS_DECORATOR_TAG_LIST_NAME, TAGS_DECORATOR_ATTR_DICT_NAME)
 from cafe.common.reporting.reporter import Reporter
-from cafe.configurator.managers import (
-    UnittestRunnerTestEnvManager, EngineDirectoryManager, EngineConfigManager)
+from cafe.configurator.managers import TestEnvManager
 
-UnittestRunnerTestEnvManager.set_engine_config_path()
-engine_config = UnittestRunnerTestEnvManager.get_engine_config_interface()
-test_repo_path = UnittestRunnerTestEnvManager.set_test_repo_package_path()
-BASE_DIR = EngineDirectoryManager.OPENCAFE_ROOT_DIR
+
+def tree(directory, padding, print_files=False):
+    """
+    creates an ascii tree for listing files or configs
+    """
+    files = []
+    dir_token = "{0}+-".format(padding[:-1])
+    dir_path = os.path.basename(os.path.abspath(directory))
+
+    print "{0}{1}/".format(dir_token, dir_path)
+
+    padding = "{0}{1}".format(padding, " ")
+
+    if print_files:
+        try:
+            files = os.listdir(directory)
+        except OSError:
+            print "Directory: {0} Does Not Exist".format(directory)
+    else:
+        files = [name for name in os.listdir(directory) if
+                 os.path.isdir(os.path.join(directory, name))]
+    count = 0
+    for file_name in files:
+        count += 1
+        path = os.path.join(directory, file_name)
+        if os.path.isdir(path):
+            if count == len(files):
+                tree(path, "".join([padding, " "]), print_files)
+            else:
+                tree(path, "".join([padding, "|"]), print_files)
+        else:
+            if (not file_name.endswith(".pyc") and file_name != "__init__.py"):
+                print "{0}{1}".format(padding, file_name)
+
+
+def error_msg(e_type, e_msg):
+    """
+    creates an error message
+    """
+    err_msg = "<[WARNING {0} ERROR {1}]>".format(str(e_type), str(e_msg))
+
+    return err_msg
+
+
+def print_traceback():
+    """
+    formats and prints out a minimal stack trace
+    """
+    info = sys.exc_info()
+    excp_type, excp_value = info[:2]
+    err_msg = error_msg(excp_type.__name__,
+                        excp_value)
+    print err_msg
+    for file_name, lineno, function, text in extract_tb(info[2]):
+        print ">>>", file_name
+        print "  > line", lineno, "in", function, repr(text)
+    print "-" * 100
 
 
 class _WritelnDecorator(object):
@@ -115,8 +166,11 @@ class LoadedTestClass(object):
         return class_
 
     def get_instances(self):
+        loaded = []
         for class_name in self._get_class_names(self.module):
-            yield self._get_class(self.module, class_name)
+            if class_name not in loaded:
+                loaded.append(class_name)
+                yield self._get_class(self.module, class_name)
 
     def _get_module_path(self, loaded_module):
         return os.path.dirname(loaded_module.__file__)
@@ -139,8 +193,7 @@ class SuiteBuilder(object):
         try:
             position = len(path.split(split_token)) - 1
             temp_path = "{0}{1}".format(
-                split_token,
-                path.split(split_token)[position])
+                split_token, path.split(split_token)[position])
             split_path = os.path.split(temp_path)
             dotted_path = ".".join(split_path)
         except AttributeError:
@@ -154,51 +207,29 @@ class SuiteBuilder(object):
         """
         walks the path searching for the target root folder.
         """
-        root_path = None
-
         for root, _, _ in os.walk(path):
-            if os.path.basename(root).find(target) != -1:
-                root_path = root
-                break
-            else:
-                continue
-
-        return root_path
+            if target in os.path.basename(root):
+                return root
 
     def find_file(self, path, target):
         """
         walks the path searching for the target file. the full to the target
         file is returned
         """
-        file_path = None
-
         for root, _, files in os.walk(path):
             for file_name in files:
-                if (file_name.find(target) != -1
-                        and file_name.find(".pyc") == -1):
-                    file_path = os.path.join(root, file_name)
-                    break
-                else:
-                    continue
-
-        return file_path
+                if (target in file_name and not file_name.endswith(".pyc")):
+                    return os.path.join(root, file_name)
 
     def find_subdir(self, path, target):
         """
-        walks the path searching for the target subdirectory.
-        the full to the target subdirectory is returned
+        Walks the path searching for the target subdirectory.
+        The full path to the target subdirectory is returned
         """
-        subdir_path = None
-
         for root, dirs, _ in os.walk(path):
             for dir_name in dirs:
-                if dir_name.find(target) != -1:
-                    subdir_path = os.path.join(root, dir_name)
-                    break
-                else:
-                    continue
-
-        return subdir_path
+                if target in dir_name:
+                    return os.path.join(root, dir_name)
 
     def drill_path(self, path, target):
         """
@@ -206,7 +237,7 @@ class SuiteBuilder(object):
         """
         return_path = {}
         for root, _, _ in os.walk(path):
-            if os.path.basename(root).find(target) != -1:
+            if target in os.path.basename(root):
                 return_path[target] = root
 
         return return_path
@@ -223,18 +254,17 @@ class SuiteBuilder(object):
         pkg_name = os.path.basename(package_path)
         root_path = os.path.dirname(package_path)
 
-        if module_name.find(".py") != -1:
-            module_name = module_name.split(".")[0]
+        module_name = module_name.split('.')[0]
 
-        f, p_path, description = find_module(pkg_name, [root_path])
-        loaded_pkg = load_module(pkg_name, f, p_path, description)
+        f, p_path, description = imp.find_module(pkg_name, [root_path])
 
-        f, m_path, description = find_module(
-            module_name,
-            loaded_pkg.__path__)
+        loaded_pkg = imp.load_module(pkg_name, f, p_path, description)
+
+        f, m_path, description = imp.find_module(
+            module_name, loaded_pkg.__path__)
         try:
             mod = "{0}.{1}".format(loaded_pkg.__name__, module_name)
-            loaded_module = load_module(mod, f, m_path, description)
+            loaded_module = imp.load_module(mod, f, m_path, description)
         except ImportError:
             raise
 
@@ -247,8 +277,8 @@ class SuiteBuilder(object):
         for root, _, files in os.walk(rootdir):
             for name in files:
                 if (fnmatch(name, self.module_regex)
-                        and name.find("__init__") == -1
-                        and name.find(".pyc") == -1):
+                        and name != "__init__.py"
+                        and not name.endswith(".pyc")):
                     file_name = name.split(".")[0]
                     full_path = "{0}/{1}".format(root, file_name)
                     yield full_path
@@ -275,7 +305,7 @@ class SuiteBuilder(object):
 
         return tag_list, attrs, token
 
-    def check_attrs(self, method, attrs, token=None):
+    def _check_attrs(self, method, attrs, token=None):
         """
         checks to see if the method passed in has matching key=value
         attributes. if a "+" token is passed only method that contain
@@ -295,73 +325,44 @@ class SuiteBuilder(object):
                 truth_values[len(truth_values):] = [method_val == attr_val]
             else:
                 truth_values[len(truth_values):] = [False]
-        temp = ""
-        if token == "+":
-            temp = "False not in"
-        else:
-            temp = "True in"
-        eval_string = "{0} {1}".format(temp, "truth_values")
 
-        return eval(eval_string)
+        return (
+            False not in truth_values if token == "+"
+            else True in truth_values)
 
-    def check_tags(self, method, tags, token):
+    def _check_tags(self, method, tags, token):
         """
         checks to see if the method passed in has matching tags.
         if the tags are (foo, bar) this method will match foo or
         bar. if a "+" token is passed only method that contain
         foo and bar will be match
         """
-        truth_values = []
-        method_tags = []
+        method_tags = method.__dict__.get(TAGS_DECORATOR_TAG_LIST_NAME)
+        match = set(tags).intersection(method_tags)
+        return match == set(tags) if token == "+" else bool(match)
 
-        method_tags = method.__dict__[TAGS_DECORATOR_TAG_LIST_NAME]
-
-        for tag in tags:
-            if tag in method_tags:
-                truth_values[len(truth_values):] = [True]
-            else:
-                truth_values[len(truth_values):] = [False]
-
-        temp = ""
-        if token == "+":
-            temp = "False not in"
-        else:
-            temp = "True in"
-        eval_string = "{0} {1}".format(temp, "truth_values")
-
-        return eval(eval_string)
-
-    def check_method(self, class_, method_name, tags, attrs, token):
+    def _check_method(self, class_, method_name, tags, attrs, token):
         load_test_flag = False
         attr_flag = False
         tag_flag = False
 
         method = getattr(class_, method_name)
 
-        if dict(method.__dict__) \
-                and TAGS_DECORATOR_TAG_LIST_NAME in method.__dict__:
+        if (dict(method.__dict__)
+                and TAGS_DECORATOR_TAG_LIST_NAME in method.__dict__):
             if tags and not attrs:
-                tag_flag = self.check_tags(
-                    method,
-                    tags,
-                    token)
+                tag_flag = self._check_tags(method, tags, token)
                 load_test_flag = tag_flag
+
             elif not tags and attrs:
-                attr_flag = self.check_attrs(
-                    method,
-                    attrs,
-                    token)
+                attr_flag = self._check_attrs(method, attrs, token)
                 load_test_flag = attr_flag
+
             elif tags and attrs:
-                tag_flag = self.check_tags(
-                    method,
-                    tags,
-                    token)
-                attr_flag = self.check_attrs(
-                    method,
-                    attrs,
-                    token)
+                tag_flag = self._check_tags(method, tags, token)
+                attr_flag = self._check_attrs(method, attrs, token)
                 load_test_flag = attr_flag and tag_flag
+
         return load_test_flag
 
     def build_suite(self, loaded_module):
@@ -393,22 +394,10 @@ class SuiteBuilder(object):
                     if not self.tags:
                         load_test_flag = True
                     else:
-                        load_test_flag = self.check_method(
-                            class_,
-                            method_name,
-                            tag_list,
-                            attrs,
-                            token)
-
+                        load_test_flag = self._check_method(
+                            class_, method_name, tag_list, attrs, token)
                     if load_test_flag:
-                        try:
-                            suite.addTest(class_(method_name))
-                        except ImportError:
-                            raise
-                        except AttributeError:
-                            raise
-                        except Exception:
-                            raise
+                        suite.addTest(class_(method_name))
         return suite
 
     def get_tests(self, module_path):
@@ -421,46 +410,175 @@ class SuiteBuilder(object):
             return None
 
         try:
-            suite = self.build_suite(
-                loaded_module)
-        except ImportError:
-            print_traceback()
-            return None
-        except AttributeError:
-            print_traceback()
-            return None
+            suite = self.build_suite(loaded_module)
         except Exception:
             print_traceback()
             return None
 
         return suite
 
+    def generate_suite(self, path, suite=None):
+        master_suite = suite or unittest.TestSuite()
+        for module_path in self.get_modules(path):
+            st = self.get_tests(module_path)
+            if st:
+                master_suite.addTests(st)
+        return master_suite
 
-class EnvironmentSetup(object):
-    def __init__(self):
-        pass
+    def generate_suite_list(self, path, suite_list=None):
+        master_suite_list = suite_list or []
+        for module_path in self.get_modules(path):
+            st = self.get_tests(module_path)
+            if st:
+                master_suite_list.append(st)
+        return master_suite_list
+
+
+class _UnittestRunnerCLI(object):
+
+    class ListAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            product = namespace.product or ""
+            test_env_mgr = TestEnvManager(product, None)
+            test_dir = os.path.expanduser(
+                os.path.join(test_env_mgr.test_repo_path, product))
+            product_config_dir = os.path.expanduser(os.path.join(
+                test_env_mgr.engine_config_interface.config_directory,
+                product))
+
+            def _print_test_tree():
+                print "\n<[TEST REPO]>\n"
+                tree(test_dir, " ", print_files=True)
+
+            def _print_config_tree():
+                print "\n<[CONFIGS]>\n"
+                tree(product_config_dir, " ", print_files=True)
+
+            def _print_product_tree():
+                print "\n<[PRODUCTS]>\n"
+                tree(test_env_mgr.test_repo_path, " ", print_files=False)
+
+            def _print_product_list():
+                print "\n<[PRODUCTS]>\n"
+                print "+-{0}".format(product_config_dir)
+                print "\n".join(
+                    ["  +-{0}/".format(dirname) for dirname in os.listdir(
+                        product_config_dir)])
+
+            #If no values passed, print a default
+            if not values:
+                if namespace.product and namespace.config:
+                    _print_test_tree()
+                elif namespace.product and not namespace.config:
+                    _print_config_tree()
+                    _print_test_tree()
+                elif not namespace.product and not namespace.config:
+                    _print_product_list()
+
+            # Loop through values so that the trees get printed in the order
+            # the values where passed on the command line
+            for arg in values:
+                if arg == 'products':
+                    _print_product_tree()
+
+                if arg == 'configs':
+                    _print_config_tree()
+
+                if arg == 'tests':
+                    _print_test_tree()
+
+            exit(0)
+
+    class ProductAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            # Add the product to the namespace
+            setattr(namespace, self.dest, values)
+
+    class ConfigAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            # Make sure user provided config name ends with '.config'
+            if values is not None:
+                if not str(values).endswith('.config'):
+                    values = "{0}{1}".format(values, ".config")
+
+                test_env = TestEnvManager(namespace.product or "", values)
+                if not os.path.exists(test_env.test_config_file_path):
+                    print (
+                        "cafe-runner: error: config file at {0} does not "
+                        "exist".format(test_env.test_config_file_path))
+                    exit(1)
+
+            setattr(namespace, self.dest, values)
+
+    class ModuleRegexAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            # Make sure user-specified module name has a .py at the end of it
+            if ".py" not in str(values):
+                values = "{0}{1}".format(values, ".py")
+
+            setattr(namespace, self.dest, values)
+
+    class MethodRegexAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            # Make sure user-specified method name has test_ at the start of it
+
+            if 'test_' not in str(values):
+                values = "{0}{1}".format("test_", values)
+
+            setattr(namespace, self.dest, values)
+
+    class DataAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            dict_string = ""
+            data_range = len(values)
+
+            for i in range(data_range):
+                values[i] = values[i].replace("=", "': '")
+                values[i] = "'{0}'".format(values[i])
+
+            dict_string = ", ".join(values)
+            dict_string = "{0}{1}{2}".format("{", dict_string, "}")
+            os.environ["DICT_STRING"] = dict_string
+            setattr(namespace, self.dest, values)
+
+    class DataDirectoryAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            if not os.path.exists(values):
+                print (
+                    "cafe-runner: error: data-directory '{0}' does not "
+                    "exist".format(values))
+                exit(1)
+            setattr(namespace, self.dest, values)
+
+    class VerboseAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+
+            msg = None
+            if values is None:
+                msg = "-v/--verbose requires an integer value of 1, 2 or 3"
+
+            elif values not in (1, 2, 3):
+                msg = (
+                    "cafe-runner: error: {0} is not a valid argument for "
+                    "-v/--verbose".format(values))
+            if msg:
+                print parser.usage
+                print msg
+                exit(1)
+
+            os.environ["VERBOSE"] = "true" if values == 3 else "false"
+            setattr(namespace, self.dest, values)
 
     def get_cl_args(self):
         """
         collects and parses the command line args
         creates the runner"s help msg
         """
-        base = "{0} {1} {2}".format(
-            "cafe-runner",
-            "<product>",
-            "<config>")
-        mod = "{0} {1}".format(
-            "-m",
-            "<module pattern>")
-        mthd = "{0} {1}".format(
-            "-M",
-            "<test method>")
-        testtag = "{0} {1}".format(
-            "-t",
-            "[tag tag...]")
-        pkg = "{0} {1}".format(
-            "-p",
-            "[package package...]")
+        base = "{0} {1} {2}".format("cafe-runner", "<product>", "<config>")
+        mod = "{0} {1}".format("-m", "<module pattern>")
+        mthd = "{0} {1}".format("-M", "<test method>")
+        testtag = "{0} {1}".format("-t", "[tag tag...]")
+        pkg = "{0} {1}".format("-p", "[package package...]")
 
         usage_string = """
         *run all the tests for a product
@@ -504,14 +622,25 @@ class EnvironmentSetup(object):
         name pattern, method name pattern and matching tag(s)
         {baseargs} {package} {module} {method} {tags}
 
+        LIST:
+        format: -l/--list [products, configs, tests]
+        Can be used to list products, configs and tests if used as a flag or
+        as a replacement for any required argument.
+
+        As an optional flag:
+        -l/--list 'products', 'configs' or 'tests' can be used anywhere as an
+        optional flag to print the respective list.  The runner will exit
+        after the list is printed.
+
+        As a replacement for any positional flag:
+        *list all products
+            cafe-runner -l/--list
+
+        *list configs and tests for a product
+            cafe-runner <product> -l/--list
+
         *list tests for a product
-        cafe-runner <product> -l "tests"
-
-        *list configs for a product
-        cafe-runner <product> -l "configs"
-
-        *list tests and configs for a product
-        cafe-runner <product> -l "tests" "configs"
+            cafe-runner <product> <config> -l/--list
 
         TAGS:
         format: -t [+] tag1 tag2 tag3 key1=value key2=value
@@ -533,36 +662,43 @@ class EnvironmentSetup(object):
         will be run under the products test repo folder or packages (if
         specified).
         """.format(
-            baseargs=base,
-            package=pkg,
-            module=mod,
-            method=mthd,
-            tags=testtag)
+            baseargs=base, package=pkg, module=mod, method=mthd, tags=testtag)
 
         desc = "Cloud Common Automated Engine Framework"
 
         argparser = argparse.ArgumentParser(
-            usage=usage_string,
-            description=desc)
+            usage=usage_string, description=desc)
 
         argparser.add_argument(
             "product",
+            action=self.ProductAction,
+            nargs='?',
+            default=None,
             metavar="<product>",
             help="product name")
 
         argparser.add_argument(
             "config",
-            nargs="?",
+            action=self.ConfigAction,
+            nargs='?',
             default=None,
             metavar="<config_file>",
             help="product test config")
 
         argparser.add_argument(
             "-v", "--verbose",
+            action=self.VerboseAction,
             nargs="?",
             default=2,
             type=int,
-            help="verbosity")
+            help="set unittest output verbosity")
+
+        argparser.add_argument(
+            "-l", "--list",
+            action=self.ListAction,
+            nargs="*",
+            choices=["products", "configs", "tests"],
+            help="list tests and or configs")
 
         argparser.add_argument(
             "-f", "--fail-fast",
@@ -586,14 +722,16 @@ class EnvironmentSetup(object):
                  "test repo")
 
         argparser.add_argument(
-            "-m", "--module",
-            default=None,
+            "-m", "--module-regex", "--module",
+            action=self.ModuleRegexAction,
+            default="*.py",
             metavar="<module>",
             help="test module regex - defaults to '*.py'")
 
         argparser.add_argument(
             "-M", "--method-regex",
-            default=None,
+            action=self.MethodRegexAction,
+            default="test_*",
             metavar="<method>",
             help="test method regex defaults to 'test_'")
 
@@ -605,21 +743,13 @@ class EnvironmentSetup(object):
             help="tags")
 
         argparser.add_argument(
-            "-l", "--list",
-            nargs="*",
-            choices=["tests", "configs"],
-            metavar="'tests' 'configs'",
-            help="list tests and or configs")
-
-        argparser.add_argument(
             "--result",
             choices=["json", "xml"],
             help="generates a specified formatted result file")
 
         argparser.add_argument(
             "--result-directory",
-            help="directory for result file to be stored"
-        )
+            help="directory for result file to be stored")
 
         argparser.add_argument(
             "--parallel",
@@ -628,10 +758,12 @@ class EnvironmentSetup(object):
 
         argparser.add_argument(
             "--data-directory",
+            action=self.DataDirectoryAction,
             help="directory for tests to get data from")
 
         argparser.add_argument(
             "-d", "--data",
+            action=self.DataAction,
             nargs="*",
             default=None,
             metavar="data",
@@ -639,229 +771,164 @@ class EnvironmentSetup(object):
 
         args = argparser.parse_args()
 
-        if args.verbose < 0 or args.verbose > 3:
-            print "cafe-runner: error: argument out of range: {0}".format(
-                args.verbose)
+        # Special case for when product or config is missing and --list
+        # wasn't called
+        if args.product is None or args.config is None:
+            print argparser.usage
+            print (
+                "cafe-runner: error: You must supply both a product and a "
+                "config to run tests")
+            exit(1)
+
+        if (args.result or args.result_directory) and (
+                args.result is None or args.result_directory is None):
+            print argparser.usage
+            print (
+                "cafe-runner: error: You must supply both a --result and a "
+                "--result-directory to print out json or xml formatted "
+                "results.")
             exit(1)
 
         return args
 
-    def get_parent_path(self):
-        if os.path.exists(BASE_DIR) is False:
-            return None
 
-        return BASE_DIR
-
-    def get_repo_path(self, product):
-        """
-        returns the base string for the test repo directory
-        """
-
-        repo_path = None
-
-        try:
-            repo_path = os.path.join("{0}".format(
-                test_repo_path),
-                product)
-        except AttributeError:
-            pass
-
-        try:
-            if os.path.exists(repo_path) is False:
-                return None
-        except TypeError:
-            return None
-
-        return repo_path
-
-    def get_config_file_name(self, cfg_file):
-        cfg_file_name = None
-
-        if cfg_file.find(".config") == -1:
-            cfg_file_name = "{0}.{1}".format(cfg_file, "config")
-        else:
-            cfg_file_name = cfg_file
-
-        return cfg_file_name
-
-    def get_config_path(self, parent_path, product, cfg_file_name):
-        """
-        returns the base string for the config path
-        """
-        cfg_path = None
-
-        try:
-            cfg_path = os.path.join(
-                parent_path,
-                "configs",
-                product,
-                cfg_file_name)
-        except AttributeError:
-            pass
-
-        try:
-            if os.path.exists(cfg_path) is False:
-                return None
-        except TypeError:
-            return None
-
-        return cfg_path
-
-    def get_module_regex(self, module):
-        module_regex = module_regex = "*.py"
-
-        if module:
-            if module.find(".py") != -1:
-                module_regex = module
-            else:
-                module_regex = "{0}.{1}".format(module, "py")
-
-        return module_regex
-
-    def get_method_regex(self, method):
-        method_regex = "test_*"
-
-        if method:
-            if method.find("test_") != -1:
-                method_regex = method
-            else:
-                method_regex = "{0}{1}".format("test_", method)
-
-        return method_regex
-
-    def parse_cl_data(self, data):
-        dict_string = ""
-        data_range = len(data)
-
-        for i in range(data_range):
-            data[i] = data[i].replace("=", "': '")
-            data[i] = "'{0}'".format(data[i])
-
-        dict_string = ", ".join(data)
-        dict_string = "{0}{1}{2}".format("{", dict_string, "}")
-        os.environ["DICT_STRING"] = dict_string
-
-    def check_env_data(self, env_data, env_error):
-        return check_data(env_data, env_error)
-
-
-class RunnerSetup(object):
+class UnittestRunner(object):
     def __init__(self):
-        pass
+        self.cl_args = _UnittestRunnerCLI().get_cl_args()
+        self.test_env = TestEnvManager(
+            self.cl_args.product, self.cl_args.config)
 
-    def get_runner(self, parallel, fail_fast, verbosity):
+        # If something in the cl_args is supposed to override a default, like
+        # say that data directory or something, it needs to happen before
+        # finalize() is called
+        self.test_env.test_data_directory = (
+            self.test_env.test_data_directory or self.cl_args.data_directory)
+        self.product_repo_path = os.path.join(
+            self.test_env.test_repo_path, self.cl_args.product)
+        self.test_env.finalize()
+        self.print_mug_and_paths(self.test_env)
+
+    @staticmethod
+    def print_mug_and_paths(test_env):
+        print """
+    ( (
+     ) )
+  .........
+  |       |___
+  |       |_  |
+  |  :-)  |_| |
+  |       |___|
+  |_______|
+=== CAFE Runner ==="""
+        print "=" * 150
+        print "Percolated Configuration"
+        print "-" * 150
+        print "BREWING FROM: ....: {0}".format(test_env.test_repo_path)
+        print "ENGINE CONFIG FILE: {0}".format(test_env.engine_config_path)
+        print "TEST CONFIG FILE..: {0}".format(test_env.test_config_file_path)
+        print "DATA DIRECTORY....: {0}".format(test_env.test_data_directory)
+        print "LOG PATH..........: {0}".format(test_env.test_log_dir)
+        print "=" * 150
+
+    @staticmethod
+    def execute_test(runner, test, results):
+        result = runner.run(test)
+        results.append(result)
+
+    @staticmethod
+    def get_runner(parallel, fail_fast, verbosity):
         test_runner = None
 
         # Use the parallel text runner so the console logs look correct
         if parallel:
-            test_runner = OpenCafeParallelTextTestRunner(verbosity=int(verbosity))
+            test_runner = OpenCafeParallelTextTestRunner(
+                verbosity=int(verbosity))
         else:
             test_runner = unittest.TextTestRunner(verbosity=int(verbosity))
 
         test_runner.failfast = fail_fast
-
         return test_runner
 
-    def get_safe_file_date(self):
+    @staticmethod
+    def dump_results(start, finish, results):
+        print "-" * 71
+
+        tests_run = 0
+        errors = 0
+        failures = 0
+        for result in results:
+            tests_run += result.testsRun
+            errors += len(result.errors)
+            failures += len(result.failures)
+
+        print "Ran {0} test{1} in {2:.3f}s".format(
+            tests_run, "s" if tests_run != 1 else "", finish - start)
+
+        if failures or errors:
+            print "\nFAILED ({0}{1}{2})".format(
+                "Failures={0}".format(failures) if failures else "",
+                " " if failures and errors else "",
+                "Errors={0}".format(errors) if errors else "")
+
+        return errors, failures, tests_run
+
+    def run(self):
         """
-        @summary: Builds a date stamp that is safe for use in a file path/name
-        @return: The safely formatted datetime string
-        @rtype: C{str}
+        loops through all the packages, modules, and methods sent in from
+        the command line and runs them
         """
-        return str(datetime.now()).replace(" ", "_").replace(":", "_")
+        master_suite = unittest.TestSuite()
+        parallel_test_list = []
 
-    def get_root_log_path(self, log_dir, product, config):
-        root_log_path = None
+        builder = SuiteBuilder(
+            self.cl_args.module_regex,
+            self.cl_args.method_regex,
+            self.cl_args.tags,
+            self.cl_args.supress_flag)
 
-        if not log_dir or not product or not config:
-            return None
+        test_runner = self.get_runner(
+            self.cl_args.parallel,
+            self.cl_args.fail_fast,
+            self.cl_args.verbose)
+
+        #Build master test suite
+        if self.cl_args.packages:
+            for package_name in self.cl_args.packages:
+                path = builder.find_subdir(
+                    self.product_repo_path, package_name)
+                if path is None:
+                    print error_msg("PACKAGE", package_name)
+                    continue
+                master_suite = builder.generate_suite(path, master_suite)
+                if self.cl_args.parallel:
+                    parallel_test_list = builder.generate_suite_list(
+                        path, parallel_test_list)
         else:
-            root_log_path = os.path.join(log_dir, product, config)
+            master_suite = builder.generate_suite(
+                self.product_repo_path)
+            if self.cl_args.parallel:
+                parallel_test_list = builder.generate_suite_list(
+                    self.product_repo_path)
 
-        return root_log_path
-
-    def get_stats_log_path(self, log_dir, product, config):
-        stats_log_path = None
-
-        if not log_dir or not product or not config:
-            return None
+        if self.cl_args.parallel:
+            exit_code = self.run_parallel(
+                parallel_test_list,
+                test_runner,
+                result_type=self.cl_args.result,
+                results_path=self.cl_args.result_directory)
+            exit(exit_code)
         else:
-            stats_log_path = os.path.join(
-                log_dir, product, config, 'statistics')
+            exit_code = self.run_serialized(
+                master_suite,
+                test_runner,
+                result_type=self.cl_args.result,
+                results_path=self.cl_args.result_directory)
+            exit(exit_code)
 
-        return stats_log_path
+    def run_parallel(
+            self, test_suites, test_runner, result_type=None,
+            results_path=None):
 
-    def get_product_log_path(self, log_dir, product, config):
-        product_log_path = None
-
-        if not log_dir or not product or not config:
-            return None
-        else:
-            product_log_path = os.path.join(
-                log_dir, product, config, self.get_safe_file_date())
-        return product_log_path
-
-    def _set_default_data_dir(self):
-        data_dir = os.path.expanduser(engine_config.data_directory)
-        if not os.path.isdir(data_dir):
-            os.makedirs(data_dir)
-
-        return data_dir
-
-    def _set_user_data_dir(self, dir_name):
-        data_dir = None
-        home = os.path.expanduser("~")
-
-        if "home" not in os.path.expanduser(dir_name).split("/"):
-            temp_dir = "{0}/{1}".format(home, dir_name)
-        else:
-            temp_dir = dir_name
-
-        if os.path.isdir(temp_dir) is False:
-            return None
-        else:
-            data_dir = temp_dir
-
-        return data_dir
-
-    def create_data_dir(self, user_data_dir):
-        data_dir = None
-
-        if user_data_dir is None:
-            data_dir = self._set_default_data_dir()
-        else:
-            data_dir = self._set_user_data_dir(user_data_dir)
-
-        return data_dir
-
-    def create_stats_log_dir(self, stats_log_path):
-        if os.path.isdir(stats_log_path) is not True:
-            os.makedirs(stats_log_path)
-
-    def create_product_log_dir(self, product_log_path):
-        if os.path.isdir(product_log_path) is not True:
-            os.makedirs(product_log_path)
-
-    def set_env(self, key, value):
-        """
-        sets an environment var so the tests can find their respective
-        product config path
-        """
-        os.environ[key] = value
-
-    def check_runner_data(self, runner_data, runner_error):
-        return check_data(runner_data, runner_error)
-
-
-class OpenCafeRunner(object):
-    """
-    Open Cafe Runner
-    """
-    def __init__(self):
-        pass
-
-    def run_parallel(self, test_suites, test_runner, result_type=None,
-                     results_path=None):
         exit_code = 0
         proc = None
         unittest.installHandler()
@@ -871,10 +938,9 @@ class OpenCafeRunner(object):
         start = time.time()
 
         for test_suite in test_suites:
-            proc = Process(target=execute_test, args=(
-                test_runner,
-                test_suite,
-                results))
+            proc = Process(
+                target=self.execute_test,
+                args=(test_runner, test_suite, results))
             processes.append(proc)
             proc.start()
 
@@ -883,29 +949,29 @@ class OpenCafeRunner(object):
 
         finish = time.time()
 
-        errors, failures, _ = dump_results(start, finish, results)
+        errors, failures, _ = self.dump_results(start, finish, results)
 
         if result_type is not None:
             all_results = []
             for tests, result in zip(test_suites, results):
                 result_parser = SummarizeResults(
-                    vars(result),
-                    tests,
-                    (finish - start))
+                    vars(result), tests, (finish - start))
                 all_results += result_parser.gather_results()
 
-            reporter = Reporter(result_parser=result_parser,
-                                all_results=all_results)
-            reporter.generate_report(result_type=result_type,
-                                     path=results_path)
+            reporter = Reporter(
+                result_parser=result_parser, all_results=all_results)
+            reporter.generate_report(
+                result_type=result_type, path=results_path)
 
         if failures or errors:
             exit_code = 1
 
         return exit_code
 
-    def run_serialized(self, master_suite, test_runner, result_type=None,
-                       results_path=None):
+    def run_serialized(
+            self, master_suite, test_runner, result_type=None,
+            results_path=None):
+
         exit_code = 0
         unittest.installHandler()
         start_time = time.time()
@@ -927,353 +993,8 @@ class OpenCafeRunner(object):
 
         return exit_code
 
-    def run(self):
-        """
-        loops through all the packages, modules, and methods sent in from
-        the command line and runs them
-        """
-        cl_args = None
-        parent_path = None
-        repo_path = None
-        env_setup = None
-
-        env_paths = {}
-        env_setup = EnvironmentSetup()
-
-        cl_args = env_setup.get_cl_args()
-        cfg_file_name = env_setup.get_config_file_name(cl_args.config)
-
-        parent_path = env_paths["parent_path"] = env_setup.get_parent_path()
-
-        repo_path = env_paths["repo_path"] = env_setup.get_repo_path(
-            cl_args.product)
-
-        if cl_args.list is not None:
-            print_tree(cl_args.product, cl_args.list, repo_path, parent_path)
-            exit(0)
-        else:
-            method_regex = None
-            module_regex = None
-            config_path = None
-
-            if cl_args.data:
-                env_setup.parse_cl_data(cl_args.data)
-
-            module_regex = env_setup.get_module_regex(cl_args.module)
-
-            method_regex = env_setup.get_method_regex(cl_args.method_regex)
-
-            cfg_file_name = env_setup.get_config_file_name(cl_args.config)
-
-            config_path = env_paths["config_path"] = env_setup.get_config_path(
-                parent_path,
-                cl_args.product,
-                cfg_file_name)
-
-            env_error = \
-                {"parent_path": ["DEFAULT DIR",
-                                 "{0} does not exist".format(BASE_DIR)],
-                 "config_path":
-                    ["CONFIG",
-                     "{0} config does not exist".format(cl_args.config)],
-                 "repo_path":
-                    ["REPO",
-                     "{0} repo does not exist".format(cl_args.product)]}
-
-            if env_setup.check_env_data(env_paths, env_error):
-                print "Exiting"
-                exit(1)
-
-            test_suites = []
-            builder = None
-            stats_log_path = None
-            product_log_path = None
-            data_dir = None
-            suite = unittest.TestSuite()
-            master_suite = unittest.TestSuite()
-            runner_setup = RunnerSetup()
-
-            runner_paths = {}
-
-            builder = SuiteBuilder(
-                module_regex,
-                method_regex,
-                cl_args.tags,
-                cl_args.supress_flag)
-
-            test_runner = runner_setup.get_runner(
-                cl_args.parallel,
-                cl_args.fail_fast,
-                cl_args.verbose)
-
-            log_dir = os.path.expanduser(engine_config.log_directory)
-
-            root_log_path = runner_paths["root_log_path"] = \
-                runner_setup.get_root_log_path(
-                    log_dir,
-                    cl_args.product,
-                    cfg_file_name)
-
-            stats_log_path = runner_paths["stats_log_path"] = \
-                runner_setup.get_stats_log_path(
-                    log_dir,
-                    cl_args.product,
-                    cfg_file_name)
-
-            product_log_path = runner_paths["product_log_path"] = \
-                runner_setup.get_product_log_path(
-                    log_dir,
-                    cl_args.product,
-                    cfg_file_name)
-
-            data_dir = runner_paths["data_dir"] = \
-                runner_setup.create_data_dir(cl_args.data_directory)
-
-            master_log_file_name = engine_config.master_log_file_name
-
-            runner_error = \
-                {"stats_log_path":
-                    ["CAFE_ROOT_LOG_PATH",
-                     "{0} does not exist".format(stats_log_path)],
-                 "product_log_path":
-                    ["CAFE_TEST_LOG_PATH",
-                     "{0} config does not exist".format(product_log_path)],
-                 "data_dir":
-                    ["CAFE_DATA_DIR_PATH", "{0} does not exist".format(data_dir)]}
-
-            if runner_setup.check_runner_data(runner_paths, runner_error):
-                print "Exiting"
-                exit(1)
-
-            runner_setup.create_stats_log_dir(stats_log_path)
-
-            runner_setup.create_product_log_dir(product_log_path)
-
-            verbose_flag = "false"
-            if cl_args.verbose == 3:
-                verbose_flag = "true"
-
-            #TODO: change this so that it prints the key/value that errored
-            try:
-                runner_setup.set_env("CAFE_CONFIG_FILE_PATH", config_path)
-                runner_setup.set_env("CAFE_ROOT_LOG_PATH", root_log_path)
-                runner_setup.set_env("CAFE_TEST_LOG_PATH", product_log_path)
-                runner_setup.set_env("CAFE_DATA_DIR_PATH", data_dir)
-                runner_setup.set_env(
-                    "CAFE_MASTER_LOG_FILE_NAME", master_log_file_name)
-                runner_setup.set_env("VERBOSE", verbose_flag)
-            except TypeError:
-                print "Environment variable not set - Exiting"
-                exit(1)
-
-            print_paths(config_path, data_dir, product_log_path)
-
-            if not cl_args.packages:
-                for module_path in builder.get_modules(repo_path):
-                    suite = builder.get_tests(module_path)
-                    master_suite.addTests(suite)
-                    test_suites.append(suite)
-            else:
-                for package_name in cl_args.packages:
-                    test_path = builder.find_subdir(repo_path, package_name)
-
-                    if test_path is None:
-                        print error_msg("PACKAGE", package_name)
-                        continue
-
-                    for module_path in builder.get_modules(test_path):
-                        suite = builder.get_tests(module_path)
-                        master_suite.addTests(suite)
-                        test_suites.append(suite)
-
-            if cl_args.parallel:
-                exit_code = self.run_parallel(
-                    test_suites,
-                    test_runner,
-                    result_type=cl_args.result,
-                    results_path=cl_args.result_directory)
-                exit(exit_code)
-            else:
-                exit_code = self.run_serialized(
-                    master_suite,
-                    test_runner,
-                    result_type=cl_args.result,
-                    results_path=cl_args.result_directory)
-                exit(exit_code)
-
-
-def check_data(data, errors):
-    error_flag = False
-    for key in data:
-        if not data[key]:
-            err_msg = error_msg(
-                errors[key][0],
-                errors[key][1])
-            error_flag = True
-            print err_msg
-    return error_flag
-
-
-def execute_test(runner, test, results):
-    result = runner.run(test)
-    results.append(result)
-
-
-def dump_results(start, finish, results):
-    print "-" * 71
-
-    run = 0
-    errors = 0
-    failures = 0
-    for result in results:
-        run += result.testsRun
-        errors += len(result.errors)
-        failures += len(result.failures)
-
-    print ("Ran %d test%s in %.3fs" % (run,
-                                       run != 1 and "s" or "",
-                                       finish - start))
-
-    fail = ""
-    error = ""
-    space = ""
-    if failures:
-        fail = "Failures=%d" % failures
-    if errors:
-        error = "Errors=%d" % errors
-    if failures or errors:
-        if failures and errors:
-            space = " "
-        print
-        print "FAILED ({0}{1}{2})".format(fail, space, error)
-
-    return errors, failures, run
-
-
-def tree(directory, padding, print_files=False):
-    """
-    creates an ascii tree for listing files or configs
-    """
-    files = []
-    dir_token = "{0}+-".format(padding[:-1])
-    dir_path = os.path.basename(os.path.abspath(directory))
-
-    print "{0}{1}/".format(dir_token, dir_path)
-
-    padding = "{0}{1}".format(padding, " ")
-
-    if print_files:
-        try:
-            files = os.listdir(directory)
-        except OSError:
-            print "Config directory: {0} Does Not Exist".format(directory)
-    else:
-        files = [name for name in os.listdir(directory) if
-                 os.path.isdir(os.path.join(directory, name))]
-    count = 0
-    for file_name in files:
-        count += 1
-        path = os.path.join(directory, file_name)
-        if os.path.isdir(path):
-            if count == len(files):
-                tree(path, "".join([padding, " "]), print_files)
-            else:
-                tree(path, "".join([padding, "|"]), print_files)
-        else:
-            if (file_name.find(".pyc") == -1 and
-                    file_name != "__init__.py"):
-                print "{0}{1}".format(padding, file_name)
-
-
-def colorize(msg, color):
-    """
-    colorizes a string
-    """
-    end = "\033[1;m"
-    colorized_msg = "".join([color, str(msg), end])
-
-    return colorized_msg
-
-
-def print_tree(product, list_args, repo_path, parent_path):
-    arg_list = []
-    if not list_args:
-        arg_list = ["tests", "configs"]
-    else:
-        arg_list = list_args
-
-    for arg in arg_list:
-        if arg == "tests":
-            banner = "\n<[TEST REPO]>\n"
-            path = repo_path
-        else:
-            banner = "\n<[CONFIGS]>\n"
-            path = os.path.join(
-                parent_path,
-                "configs",
-                product)
-
-        print banner
-        tree(path, " ", print_files=True)
-
-
-def error_msg(e_type, e_msg):
-    """
-    creates an error message
-    """
-    err_msg = "<[WARNING {0} ERROR {1}]>".format(str(e_type), str(e_msg))
-
-    return err_msg
-
-
-def print_traceback():
-    """
-    formats and prints out a minimal stack trace
-    """
-    info = sys.exc_info()
-    excp_type, excp_value = info[:2]
-    err_msg = error_msg(excp_type.__name__,
-                        excp_value)
-    print err_msg
-    for file_name, lineno, function, text in extract_tb(info[2]):
-        print ">>>", file_name
-        print "  > line", lineno, "in", function, repr(text)
-    print "-" * 100
-
-
-def print_paths(config_path, data_dir, log_path):
-    print
-    print "=" * 150
-    print "Percolated Configuration"
-    print "-" * 150
-    print "ENGINE CONFIG FILE: {0}".format(
-        EngineConfigManager.ENGINE_CONFIG_PATH)
-    print "TEST CONFIG FILE..: {0}".format(config_path)
-    print "DATA DIRECTORY....: {0}".format(data_dir)
-    print "LOG PATH..........: {0}".format(log_path)
-    print "=" * 150
-
 
 def entry_point():
-    ascii_mug ="""
-      ( (
-       ) )
-    .........
-    |       |___
-    |       |_  |
-    |  :-)  |_| |
-    |       |___|
-    |_______|
-=== CAFE Runner ==="""
-
-    brew = "Brewing from {0}".format(BASE_DIR)
-
-    print ascii_mug
-
-    print "-" * len(brew)
-    print brew
-    print "-" * len(brew)
-
-    runner = OpenCafeRunner()
+    runner = UnittestRunner()
     runner.run()
     exit(0)
